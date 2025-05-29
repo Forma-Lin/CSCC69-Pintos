@@ -8,14 +8,18 @@
 
 >> Fill in the names and email addresses of your group members.
 
-FirstName LastName <email@domain.example>
-FirstName LastName <email@domain.example>
-FirstName LastName <email@domain.example>
+Hansen Lin hansen.lin@mail.utoronto.ca
 
 ---- PRELIMINARIES ----
 
 >> If you have any preliminary comments on your submission, notes for the
 >> TAs, or extra credit, please give them here.
+
+The 'alarm-simultaneous' test passes reliably with QEMU but shows minor
+1-tick discrepancies for some threads with Bochs. This is likely due to
+emulator timing differences and the nature of scheduling multiple threads
+woken by the same timer interrupt. The core timer_sleep logic ensures threads
+are made ready at their target tick.
 
 >> Please cite any offline or online sources you consulted while
 >> preparing your submission, other than the Pintos documentation, course
@@ -26,54 +30,190 @@ FirstName LastName <email@domain.example>
 
 ---- DATA STRUCTURES ----
 
->> A1: Copy here the declaration of each new or changed `struct' or
->> `struct' member, global or static variable, `typedef', or
+>> A1: Copy here the declaration of each new or changed 'struct' or
+>> 'struct' member, global or static variable, 'typedef', or
 >> enumeration.  Identify the purpose of each in 25 words or less.
 
+In 'threads/thread.h', added to 'struct thread':
+    struct semaphore sleep_sema;        /* Semaphore for sleeping. */
+    int64_t wake_time;                  /* Tick when thread should wake up. */
+    struct list_elem sleep_elem;        /* List element for sleeping list. */
+
+In 'threads/thread.h', added include:
+    #include "threads/synch.h"          /* For struct semaphore definition. */
+
+In 'devices/timer.c', added global static variable:
+    static struct list sleeping_list;   /* List of sleeping threads, ordered by wake_time. */
 ---- ALGORITHMS ----
 
 >> A2: Briefly describe what happens in a call to timer_sleep(),
 >> including the effects of the timer interrupt handler.
 
+'timer_sleep()':
+1. If 'ticks <= 0', returns immediately.
+2. Asserts that interrupts are enabled.
+3. Gets the current thread 'cur'.
+4. Calculates 'cur->wake_time = timer_ticks() + ticks'.
+5. Disables interrupts.
+6. Inserts 'cur' into the global 'sleeping_list' using 'list_insert_ordered()' with a comparison function based on 'wake_time'.
+7. Re-enables interrupts (restores previous interrupt level).
+8. Calls 'sema_down(&cur->sleep_sema)' to block the thread.
+
+'timer_interrupt()' (handler for each timer tick):
+1. Increments the global 'ticks' counter.
+2. Calls 'wake_sleeping_threads()'.
+3. Calls 'thread_tick()' for scheduler time-slicing.
+
+'wake_sleeping_threads()' (called by 'timer_interrupt()'):
+1. Iterates 'sleeping_list' from the front (earliest 'wake_time').
+2. For each thread 't' whose 'wake_time <= ticks':
+    a. Removes 't' from 'sleeping_list'.
+    b. Calls 'sema_up(&t->sleep_sema)' to unblock 't'.
+3. Stops if a thread not yet due to wake is found (list is sorted).
+Note: This function runs in interrupt context, so no additional interrupt control is needed.
+
 >> A3: What steps are taken to minimize the amount of time spent in
 >> the timer interrupt handler?
+
+1.  **Sorted Sleeping List**: 'sleeping_list' is kept sorted by 'wake_time'. 'wake_sleeping_threads()' only checks threads from the front.
+2.  **Early Exit**: The loop in 'wake_sleeping_threads()' stops as soon as a thread is found that isn't due to wake, avoiding iteration over the entire list if many threads are sleeping for longer periods.
+3.  **Efficient Operations**: Uses Pintos list operations which are efficient. 'sema_up' is also efficient.
+4.  **Minimal Work in Interrupt**: The handler itself ('timer_interrupt') does minimal work: increments ticks, calls helper to wake threads, calls 'thread_tick'.
 
 ---- SYNCHRONIZATION ----
 
 >> A4: How are race conditions avoided when multiple threads call
 >> timer_sleep() simultaneously?
 
+1.  **Per-Thread Semaphore**: Each thread has its own 'sleep_sema'. Blocking on this semaphore does not interfere with other threads.
+2.  **Atomic List Modification**: The global 'sleeping_list' is modified (insertion in 'timer_sleep', removal in 'wake_sleeping_threads') with interrupts disabled. This prevents concurrent access and modification from 'timer_sleep' and 'timer_interrupt'.
+3.  **Per-Thread Sleep Data**: 'wake_time' and 'sleep_elem' are part of 'struct thread', avoiding shared data conflicts for these parameters.
+
 >> A5: How are race conditions avoided when a timer interrupt occurs
 >> during a call to timer_sleep()?
+
+The critical section in 'timer_sleep()' where the current thread is added to 'sleeping_list' is protected by disabling interrupts ('enum intr_level old_level = intr_disable(); ... intr_set_level(old_level);').
+If a timer interrupt is raised during this period, its handling is deferred until interrupts are re-enabled by 'timer_sleep()'.
+Once the thread is safely on the 'sleeping_list' and 'timer_sleep()' re-enables interrupts (before calling 'sema_down'), a subsequent timer interrupt will correctly see the thread in the list and can wake it if its 'wake_time' is due.
 
 ---- RATIONALE ----
 
 >> A6: Why did you choose this design?  In what ways is it superior to
 >> another design you considered?
 
+This design provides efficient, non-busy waiting for 'timer_sleep()':
+1.  **Efficiency**: Replaces busy-waiting (original 'timer_sleep' yielded in a loop) with blocking on a semaphore. This saves CPU cycles.
+2.  **Accuracy**: Waking threads based on a sorted list processed by the timer interrupt is more accurate and responsive.
+3.  **Minimized Interrupt Handler Time**: The sorted list and early exit in 'wake_sleeping_threads()' keep the interrupt handler efficient.
+4.  **Simplicity with Per-Thread Semaphores**: Each thread managing its own sleep semaphore ('sleep_sema') is conceptually simple and avoids complex shared synchronization for the blocking mechanism itself.
+It is superior to:
+*   **Original Busy-Wait**: Highly inefficient.
+*   **Unsorted List of Sleepers**: Would require O(N) scan in timer interrupt.
+*   **Single Global Sleep Condition Variable**: More complex signaling and potential for thundering herd or spurious wake-ups.
+
              PRIORITY SCHEDULING
              ===================
 
 ---- DATA STRUCTURES ----
 
->> B1: Copy here the declaration of each new or changed `struct' or
->> `struct' member, global or static variable, `typedef', or
+>> B1: Copy here the declaration of each new or changed 'struct' or
+>> 'struct' member, global or static variable, 'typedef', or
 >> enumeration.  Identify the purpose of each in 25 words or less.
+
+In 'threads/thread.h', 'struct thread' additions/modifications:
+    int base_priority;                  /* Original priority before donation. */
+    int effective_priority;             /* Current effective priority. */
+    struct list donors;                 /* List of threads donating to this thread. */
+    struct list_elem donor_elem;        /* Element for donor lists. */
+    struct lock *waiting_for;           /* Lock this thread is waiting for. */
+    struct list held_locks;             /* List of locks held by this thread. */
+
+In 'threads/synch.h', 'struct lock' additions:
+    struct list_elem held_elem; /* Element for thread's held_locks list. */
+    int max_priority;           /* Highest priority among waiting threads. */
+
+---- ALGORITHMS ----
 
 >> B2: Explain the data structure used to track priority donation.
 >> Use ASCII art to diagram a nested donation.  (Alternately, submit a
 >> .png file.)
 
----- ALGORITHMS ----
+Priority donation is tracked using:
+1.  'struct thread' members:
+    *   'waiting_for' (points to the 'struct lock' a thread is waiting for).
+    *   'donors' (a 'list' of threads donating to this thread).
+    *   'donor_elem' (to put a thread in a 'donors' list).
+    *   'held_locks' (a 'list' of locks held by this thread).
+    *   'base_priority' (original priority) and 'effective_priority' (current effective priority including donations).
+2.  'struct lock' member:
+    *   'held_elem' (to put a lock in a 'held_locks' list).
+
+When thread T_waiter (priority P_W) waits for lock L held by T_holder (effective priority P_H_eff):
+- T_waiter sets 'waiting_for = L'.
+- T_waiter is added to 'T_holder->donors'.
+- T_holder's 'effective_priority' is updated if P_W > P_H_eff. This change propagates if T_holder is also waiting.
+
+ASCII art for nested donation (H > M > L in base priority):
+L holds LockA. M holds LockB.
+1. H wants LockB (held by M). H donates to M. M's effective priority becomes H's.
+   'H (eff_P_H) -> M (eff_P_H, was_P_M)'
+   'M.donors = [H]'
+   'H.waiting_for = LockB'
+2. M (now high priority) wants LockA (held by L). M donates to L. M's effective priority becomes M's (now H's).
+   'M (eff_P_H) -> L (eff_P_H, was_P_L)'
+   'L.donors = [M]'
+   'M.waiting_for = LockA'
+
+Result: H -> M -> L. L runs with H's priority.
+
+Thread H (P_H) --> waits for LockB
+                   |
+                   v
+Thread M (P_M, effective P_H) --> holds LockB, waits for LockA
+  .donors = [H]      |
+                     v
+Thread L (P_L, effective P_H) --> holds LockA
+  .donors = [M]
 
 >> B3: How do you ensure that the highest priority thread waiting for
 >> a lock, semaphore, or condition variable wakes up first?
 
+1.  **Ready List**: 'thread_unblock()' and 'thread_yield()' insert threads into 'ready_list' using 'list_insert_ordered()' with 'thread_priority_less_func'. 'next_thread_to_run()' takes from the front (highest priority).
+2.  **Semaphores**:
+    *   'sema_down()': Inserts waiting threads into 'sema->waiters' list using 'list_insert_ordered()' with 'thread_priority_less_func'.
+    *   'sema_up()': Uses 'list_min(&sema->waiters, thread_priority_less_func, NULL)' to find and unblock the highest-priority waiting thread. This is robust even if priorities change while waiting.
+3.  **Locks**: Implemented using semaphores. They inherit the semaphore's priority-aware waiting list and wake-up mechanism.
+4.  **Condition Variables**: 'cond_signal()' uses 'list_max()' with 'cond_priority_less_func' to find the 'semaphore_elem' in 'cond->waiters' whose associated waiting thread has the highest effective priority. It then signals that specific thread.
+
 >> B4: Describe the sequence of events when a call to lock_acquire()
 >> causes a priority donation.  How is nested donation handled?
 
+When thread 'cur' calls 'lock_acquire(lock)' and 'lock' is held by 'holder':
+1. 'cur->waiting_for' is set to 'lock'.
+2. 'cur' is added to 'holder->donors' list (via 'cur->donor_elem').
+3. 'thread_donate_priority(holder, cur->effective_priority)' is called.
+   *   Inside 'thread_donate_priority(donee, donor_priority)':
+     *   If 'donor_priority > donee->effective_priority', 'donee->effective_priority' is set to 'donor_priority'.
+     *   **Nested Donation**: If 'donee' is now higher priority and is waiting for another lock ('donee->waiting_for != NULL') held by 'recursive_holder', 'thread_donate_priority(recursive_holder, donee->effective_priority)' is called, propagating the new higher priority.
+4. 'cur' calls 'sema_down(&lock->semaphore)' and blocks.
+Upon waking and acquiring the lock:
+5. 'cur' removes itself from the previous holder's 'donors' list (if 'cur->donor_elem' indicates it's in one) and clears 'cur->waiting_for'.
+6. 'lock->holder' becomes 'cur', and 'lock' is added to 'cur->held_locks'.
+
 >> B5: Describe the sequence of events when lock_release() is called
 >> on a lock that a higher-priority thread is waiting for.
+
+When thread 'cur' calls 'lock_release(lock)':
+1. 'lock' is removed from 'cur->held_locks'.
+2. 'cur' iterates its 'donors' list. For any 'donor_thread' that was waiting for 'lock' ('donor_thread->waiting_for == lock'), it's removed from 'cur->donors', and 'donor_thread->waiting_for' is set to 'NULL'.
+3. 'thread_update_effective_priority(cur)' is called to recalculate 'cur's' effective priority based on its base and any remaining donors for other locks.
+4. 'lock->holder' is set to 'NULL'.
+5. 'sema_up(&lock->semaphore)' is called.
+   *   This crucial step uses 'list_min(&lock->semaphore.waiters, thread_priority_less_func, NULL)' to find the highest-priority thread waiting on this semaphore.
+   *   If a higher-priority thread was waiting for 'lock', it will be selected and unblocked by 'thread_unblock()'.
+6. 'thread_check_preemption()' is called by 'lock_release'.
+   *   If the thread unblocked by 'sema_up' has a higher priority than 'cur' (whose priority might have dropped), 'cur' will yield, and the newly awakened higher-priority thread will run.
+   *   Even if 'cur's' priority didn't drop, if the awoken thread is higher, preemption occurs.
 
 ---- SYNCHRONIZATION ----
 
@@ -81,11 +221,50 @@ FirstName LastName <email@domain.example>
 >> how your implementation avoids it.  Can you use a lock to avoid
 >> this race?
 
+A potential race in 'thread_set_priority()' could occur if multiple operations try to modify a thread's priority or its donation status concurrently without proper synchronization. For example:
+Thread A is executing 'thread_set_priority()' on itself. It reads its 'base_priority' and is about to recalculate its 'effective_priority' by checking its 'donors' list.
+Concurrently:
+1.  Another thread B starts donating to A, modifying A's 'donors' list and potentially A's 'effective_priority' via 'thread_donate_priority()'.
+2.  Another thread C calls 'lock_release()', which causes A to stop donating to C, leading to A's 'effective_priority' being recalculated.
+
+If these operations interleave improperly, 'thread_set_priority()' might compute an 'effective_priority' based on a stale or inconsistent state of the 'donors' list or 'base_priority'.
+
+**How avoided:**
+My implementation avoids this race primarily by disabling interrupts during critical operations related to priority manipulation:
+1.  'thread_set_priority(int new_priority)': Disables interrupts ('enum intr_level old_level = intr_disable();') at the beginning and restores them ('intr_set_level(old_level);') at the end. This makes the setting of 'base_priority' and the subsequent call to 'thread_update_effective_priority()' atomic with respect to other threads and interrupt handlers.
+2.  'thread_update_effective_priority(struct thread *t)': This function itself does not disable interrupts, but relies on its callers to do so. It iterates through the 't->donors' list to find the maximum donor priority.
+3.  'lock_acquire()' and 'lock_release()': These functions disable interrupts when modifying a thread's 'donors' list or 'waiting_for' status as part of donation logic.
+4.  'thread_donate_priority()': This function itself does not disable interrupts, but is called from within interrupt-disabled sections in 'lock_acquire()'.
+
+Since all code paths that modify priority-related fields ('effective_priority', 'base_priority', 'donors' list, 'waiting_for') do so with interrupts disabled, these operations become atomic, preventing interleaved execution and inconsistent states.
+
+**Can you use a lock?**
+Using a Pintos 'struct lock' to protect these priority structures is generally not feasible or advisable:
+1.  **Deadlock Risk**: 'thread_set_priority()' or 'thread_update_effective_priority()' might be called from within 'lock_acquire()' or 'lock_release()' (e.g., during donation propagation or priority recalculation). If 'thread_set_priority()' then tried to acquire a global priority lock, it could easily lead to deadlock.
+2.  **Interrupt Context**: Priority calculations might be relevant or triggered by operations in interrupt context (though 'thread_set_priority' is not typically called directly from an interrupt handler). Pintos locks cannot be acquired in interrupt handlers.
+3.  **Simplicity and Efficiency**: Disabling interrupts provides a simpler and more lightweight mechanism for these short critical sections. The operations are usually very fast, minimizing the impact of disabled interrupts.
+
+Therefore, disabling interrupts is the standard and appropriate synchronization primitive in Pintos for protecting core scheduler and thread state like priority.
+
 ---- RATIONALE ----
 
 >> B7: Why did you choose this design?  In what ways is it superior to
 >> another design you considered?
 
+This priority scheduling and donation design was chosen for:
+1.  **Correct Priority Inversion Handling**: The donation mechanism boosts lock-holder priority, preventing high-priority threads from being indefinitely blocked by lower-priority threads.
+2.  **Nested Donation**: Recursive donation in 'thread_donate_priority' correctly handles chains of dependencies.
+3.  **Clear Priority Distinction**: 'base_priority' (intrinsic) and 'priority' (effective, including donations) are distinct. 'thread_update_effective_priority' cleanly recalculates the effective priority.
+4.  **Priority-Aware Synchronization**: Semaphores and condition variables wake the highest-priority waiting thread. The ready list is priority-ordered.
+5.  **Preemption**: 'thread_check_preemption()' ensures the highest-priority ready thread runs after events that could change the scheduling decision (priority changes, unblocks, lock releases).
+6.  **Robust Waiter Selection**: Using list scanning ('list_min' or 'list_max') in 'sema_up' and 'cond_signal' to find the highest-priority waiter makes the system resilient, even if a waiting thread's priority changes dynamically while in a queue.
+
+It's superior to:
+*   **No Donation**: Fails to address priority inversion.
+*   **Non-Recursive/Iterative Donation**: More complex to implement correctly for deep nesting.
+*   **Immediate Re-sorting of All Queues**: Constantly re-sorting all wait queues on any priority change would be very inefficient. The current targeted updates and robust "pick-best" logic are more balanced.
+
+The design aims for correctness and adherence to Pintos principles, using interrupt disabling for atomicity of critical scheduler operations.
 
                SURVEY QUESTIONS
                ================

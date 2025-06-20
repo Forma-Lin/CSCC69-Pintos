@@ -29,20 +29,49 @@ FirstName LastName <email@domain.example>
 >> A1: Copy here the declaration of each new or changed `struct' or
 >> `struct' member, global or static variable, `typedef', or
 >> enumeration.  Identify the purpose of each in 25 words or less.
+No new global or static data structures were added for argument passing. 
+The implementation uses local variables within the setup_stack() function in src/userprog/process.c:
+char *cmd_copy;         /* Copy of command line for parsing */
+char *token, *save_ptr; /* For strtok_r() parsing */
+char *argv[128];        /* Array to store argument pointers */
+int argc = 0;           /* Argument count */
 
 ---- ALGORITHMS ----
 
 >> A2: Briefly describe how you implemented argument parsing.  How do
 >> you arrange for the elements of argv[] to be in the right order?
 >> How do you avoid overflowing the stack page?
+Implementation: Arguments are parsed in setup_stack() in process.c:
+1.  Use strtok_r() to tokenize the command line with space delimiter.
+2.  Push argument strings onto stack in forward order, saving their addresses.
+3.  Word-align the stack pointer to 4-byte boundary.
+4.  Push argv pointers in reverse order (right-to-left) to maintain correct ordering.
+5.  Push argv, argc, and fake return address.
+
+Right Order: The argv elements are pushed in reverse order but stored in correct order because the stack grows downward.
+
+Stack Overflow Prevention: Implemented with comprehensive boundary checks:
+    Calculate stack bottom boundary: void *stack_bottom = PHYS_BASE - PGSIZE;
+    Check before pushing each argument string: if ((char *)*esp - len < (char *)stack_bottom)
+    Check during word alignment: if ((char *)*esp - 1 < (char *)stack_bottom)
+    Pre-calculate and verify space for metadata (argv pointers, argc, return address)
+    Return false and cleanup allocated pages if overflow would occur
 
 ---- RATIONALE ----
 
 >> A3: Why does Pintos implement strtok_r() but not strtok()?
+Pintos implements strtok_r() because it's thread-safe. 
+strtok() uses a static global variable to maintain parsing state, 
+making it unsafe in multithreaded environments where 
+multiple threads could corrupt each other's parsing state. 
+strtok_r() requires the caller to provide storage for the parsing state.
 
 >> A4: In Pintos, the kernel separates commands into a executable name
 >> and arguments.  In Unix-like systems, the shell does this
 >> separation.  Identify at least two advantages of the Unix approach.
+1.  **Flexibility**: Shell can implement advanced features like I/O redirection, pipes, environment variables, 
+                     and scripting without kernel changes.
+2.  **Security**: Parsing errors crash the shell (user program) rather than the kernel, improving system stability.
 
                  SYSTEM CALLS
                  ============
@@ -52,15 +81,54 @@ FirstName LastName <email@domain.example>
 >> B1: Copy here the declaration of each new or changed `struct' or
 >> `struct' member, global or static variable, `typedef', or
 >> enumeration.  Identify the purpose of each in 25 words or less.
+In 'threads/thread.h', added to 'struct thread':
+struct thread *parent;              /* Parent process. */
+struct list children;               /* List of child processes' info. */
+struct child_info *child_info;      /* Info for waiting parent. */
+
+struct list files;                  /* List of open files (file_descriptor). */
+int next_fd;                        /* Next available file descriptor. */
+struct file *executable;            /* The process's executable file. */
+
+bool load_success;                  /* For exec: whether child loaded successfully. */
+struct semaphore load_sema;         /* For exec: parent blocks until child loads. */
+
+In 'threads/thread.h', new struct:
+struct child_info {
+    tid_t tid;                      /* Child's thread ID. */
+    int exit_status;                /* Child's exit status. */
+    bool has_waited_on;             /* True if parent has already waited. */
+    bool load_success;              /* True if child loaded successfully. */
+    struct list_elem elem;          /* List element for parent's children list. */
+    struct semaphore wait_sema;     /* Semaphore for parent to wait on child. */
+};
+
+struct file_descriptor {
+    int fd;
+    struct file *file;
+    struct list_elem elem;
+};
+
+In 'userprog/syscall.c':
+static struct lock filesys_lock;    /* Global lock for file system synchronization */
 
 >> B2: Describe how file descriptors are associated with open files.
 >> Are file descriptors unique within the entire OS or just within a
 >> single process?
+ile descriptors are associated with open files through struct file_descriptor which
+maps an integer fd to a struct file*. Each process maintains its own files list in its thread structure.
+File descriptors are unique only within a single process, 
+different processes can have the same FD number pointing to different files.
 
 ---- ALGORITHMS ----
 
 >> B3: Describe your code for reading and writing user data from the
 >> kernel.
+Strategy: Validate before access using:
+    is_valid_ptr() - checks if pointer is in user space and mapped
+    is_valid_buffer() - validates entire buffer range including page boundaries
+    is_valid_string() - validates null-terminated strings
+    Any invalid access terminates the process with exit status -1
 
 >> B4: Suppose a system call causes a full page (4,096 bytes) of data
 >> to be copied from user space into the kernel.  What is the least
@@ -68,9 +136,17 @@ FirstName LastName <email@domain.example>
 >> (e.g. calls to pagedir_get_page()) that might result?  What about
 >> for a system call that only copies 2 bytes of data?  Is there room
 >> for improvement in these numbers, and how much?
+4096 bytes: Minimum 1 call (if aligned to single page), Maximum 2 calls (if spans page boundary)
+2 bytes: Minimum 1 call, Maximum 2 calls (if spans page boundary)
+Improvement: Could cache page table results or validate larger chunks at once.
 
 >> B5: Briefly describe your implementation of the "wait" system call
 >> and how it interacts with process termination.
+1.  Parent searches its children list for matching child_info
+2.  If child hasn't exited, parent calls sema_down() on child's wait_sema
+3.  When child exits, it calls sema_up() on its wait_sema
+4.  Parent wakes up, retrieves exit status, removes and frees child_info
+5.  Prevents multiple waits using has_waited_on flag
 
 >> B6: Any access to user program memory at a user-specified address
 >> can fail due to a bad pointer value.  Such accesses must cause the
@@ -85,6 +161,12 @@ FirstName LastName <email@domain.example>
 >> allocated resources (locks, buffers, etc.) are freed?  In a few
 >> paragraphs, describe the strategy or strategies you adopted for
 >> managing these issues.  Give an example.
+Approach: Validate First, Execute Second
+1.  **Early Validation**: All pointers and arguments validated before acquiring resources
+2.  **Immediate Termination**: Invalid access calls sys_exit(-1) immediately
+3.  **Resource Management**: process_exit() handles cleanup of all resources (files, children, executable)
+4.  **No Partial Operations**: System calls either complete fully or fail cleanly
+Example: In sys_write(), buffer validity is checked before acquiring filesys_lock, preventing resource leaks on invalid access.
 
 ---- SYNCHRONIZATION ----
 
@@ -92,6 +174,11 @@ FirstName LastName <email@domain.example>
 >> fails, so it cannot return before the new executable has completed
 >> loading.  How does your code ensure this?  How is the load
 >> success/failure status passed back to the thread that calls "exec"?
+Approach: Uses load_sema semaphore:
+1.  Parent calls sema_down(&child->load_sema) after creating child
+2.  Child calls sema_up(&t->load_sema) after load completes
+3.  Load success/failure stored in child_info->load_success
+4.  Parent reads result from child_info structure which persists even if child exits
 
 >> B8: Consider parent process P with child process C.  How do you
 >> ensure proper synchronization and avoid race conditions when P
@@ -99,17 +186,33 @@ FirstName LastName <email@domain.example>
 >> that all resources are freed in each case?  How about when P
 >> terminates without waiting, before C exits?  After C exits?  Are
 >> there any special cases?
+P waits before C exits: P blocks on child_info->wait_sema, C signals on exit
+P waits after C exits: wait_sema already signaled, P proceeds immediately
+P terminates before C exits: P frees its child_info tracking, C's child_info becomes orphaned but C can still exit normally
+Resource Management: Each process cleans up its own resources in process_exit()
 
 ---- RATIONALE ----
 
 >> B9: Why did you choose to implement access to user memory from the
 >> kernel in the way that you did?
+Chose validation approach because:
+1.  **Security**: Prevents kernel crashes from bad pointers
+2.  **Simplicity**: Clear separation between validation and execution
+3.  **Performance**: Only validates what's needed, when needed
 
 >> B10: What advantages or disadvantages can you see to your design
 >> for file descriptors?
+Advantages:
+    Simple integer-to-file mapping
+    Per-process FD spaces prevent conflicts
+    Easy cleanup on process exit
+Disadvantages:
+    Linear search through files list (O(n))
+    No FD reuse after closing files
 
 >> B11: The default tid_t to pid_t mapping is the identity mapping.
 >> If you changed it, what advantages are there to your approach?
+Used identity mapping for simplicity. Did not change.
 
                SURVEY QUESTIONS
                ================

@@ -98,6 +98,9 @@ thread_init (void)
   init_thread (initial_thread, "main", PRI_DEFAULT);
   initial_thread->status = THREAD_RUNNING;
   initial_thread->tid = allocate_tid ();
+#ifdef USERPROG
+  initial_thread->parent = NULL;
+#endif
 }
 
 /* Starts preemptive thread scheduling by enabling interrupts.
@@ -182,6 +185,14 @@ thread_create (const char *name, int priority,
   /* Initialize thread. */
   init_thread (t, name, priority);
   tid = t->tid = allocate_tid ();
+
+#ifdef USERPROG
+  t->parent = thread_current();
+  sema_init(&t->load_sema, 0);
+  list_init(&t->children);
+  list_init(&t->files);
+  t->next_fd = 2; /* 0 for stdin, 1 for stdout */
+#endif
 
   /* Stack frame for kernel_thread(). */
   kf = alloc_frame (t, sizeof *kf);
@@ -492,6 +503,12 @@ init_thread (struct thread *t, const char *name, int priority)
   t->donor_elem.next = NULL;
   t->waiting_for = NULL;
   list_init (&t->held_locks);
+
+#ifdef USERPROG
+  list_init (&t->children);
+  list_init (&t->files);
+  t->next_fd = 2;
+#endif
 
   old_level = intr_disable ();
   list_push_back (&all_list, &t->allelem);

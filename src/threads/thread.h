@@ -110,11 +110,43 @@ struct thread
 #ifdef USERPROG
     /* Owned by userprog/process.c. */
     uint32_t *pagedir;                  /* Page directory. */
+    
+    /* For project 2: User Programs */
+    struct thread *parent;              /* Parent process. */
+    struct list children;               /* List of child processes' info. */
+    struct child_info *child_info;      /* Info for waiting parent. */
+
+    struct list files;                  /* List of open files (file_descriptor). */
+    int next_fd;                        /* Next available file descriptor. */
+    struct file *executable;            /* The process's executable file. */
+
+    bool load_success;                  /* For exec: whether child loaded successfully. */
+    struct semaphore load_sema;         /* For exec: parent blocks until child loads. */
 #endif
 
     /* Owned by thread.c. */
     unsigned magic;                     /* Detects stack overflow. */
   };
+
+/* Project 2: Structure definitions. */
+#ifdef USERPROG
+/* Structure to hold information about a child process for the parent. */
+struct child_info {
+    tid_t tid;                      /* Child's thread ID. */
+    int exit_status;                /* Child's exit status. */
+    bool has_waited_on;             /* True if parent has already waited. */
+    bool load_success;              /* True if child loaded successfully. */
+    struct list_elem elem;          /* List element for parent's children list. */
+    struct semaphore wait_sema;     /* Semaphore for parent to wait on child. */
+};
+
+/* Structure to map a file descriptor to a file. */
+struct file_descriptor {
+    int fd;
+    struct file *file;
+    struct list_elem elem;
+};
+#endif
 
 /* If false (default), use round-robin scheduler.
    If true, use multi-level feedback queue scheduler.
